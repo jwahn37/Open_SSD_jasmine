@@ -116,13 +116,16 @@ static void   load_metadata(void);
 static void   logging_pmap_table(void);
 static void   logging_misc_metadata(void);
 static void   write_page(UINT32 const lpn, UINT32 const sect_offset, UINT32 const num_sectors);
+static void   write_page_flash(UINT32 const lpn, UINT32 const sect_offset, UINT32 const num_sectors);
 static void   set_vpn(UINT32 const lpn, UINT32 const vpn);
+static void   set_vpn_flash(UINT32 const lpn, UINT32 const vpn);
 static void   garbage_collection(UINT32 const bank);
 static void   set_vcount(UINT32 const bank, UINT32 const vblock, UINT32 const vcount);
 static BOOL32 is_bad_block(UINT32 const bank, UINT32 const vblock);
 static BOOL32 check_format_mark(void);
 static UINT32 get_vcount(UINT32 const bank, UINT32 const vblock);
 static UINT32 get_vpn(UINT32 const lpn);
+static UINT32 get_vpn_flash(UINT32 const lpn);
 static UINT32 get_vt_vblock(UINT32 const bank);
 static UINT32 assign_new_write_vpn(UINT32 const bank);
 
@@ -276,8 +279,8 @@ void ftl_open(void)
 	// If necessary, do low-level format
 	// format() should be called after loading scan lists, because format() calls is_bad_block().
     //----------------------------------------
-/* 	if (check_format_mark() == FALSE) */
-	if (TRUE)
+ 	if (check_format_mark() == FALSE) 
+/*	if (TRUE)*/
 	{
         uart_print("do format");
 		format();
@@ -286,12 +289,21 @@ void ftl_open(void)
     // load FTL metadata
     else
     {
+ 	uart_print("NO format");
+
         load_metadata();
     }
 	g_ftl_read_buf_id = 0;
 	g_ftl_write_buf_id = 0;
 
     // This example FTL can handle runtime bad block interrupts and read fail (uncorrectable bit errors) interrupts
+
+//³»ÄÚµå½ÃÀÛ
+//uart_print("Let's write!");
+ //ftl_write(100, 8);
+ //ftl_read(100, 8);
+
+
     flash_clear_irq();
 
     SETREG(INTR_MASK, FIRQ_DATA_CORRUPT | FIRQ_BADBLK_L | FIRQ_BADBLK_H);
@@ -320,6 +332,7 @@ void ftl_read(UINT32 const lba, UINT32 const num_sectors)
     UINT32 lpn, sect_offset;
     UINT32 bank, vpn;
 
+//uart_printf("here is ftl_read! lab:%d , num_sectors:%d",lba,num_sectors);
     lpn          = lba / SECTORS_PER_PAGE;
     sect_offset  = lba % SECTORS_PER_PAGE;
     remain_sects = num_sectors;
@@ -374,11 +387,84 @@ void ftl_read(UINT32 const lba, UINT32 const num_sectors)
         lpn++;
     }
 }
+
+void ftl_read_flash(UINT32 const lba, UINT32 const num_sectors)
+{
+	UINT32 remain_sects, num_sectors_to_read;
+	UINT32 lpn, sect_offset;
+	UINT32 bank, vpn;
+
+	//uart_printf("here is ftl_read! lab:%d , num_sectors:%d", lba, num_sectors);
+	lpn = lba / SECTORS_PER_PAGE;
+	sect_offset = lba % SECTORS_PER_PAGE;
+	remain_sects = num_sectors;
+	//("ftl_read_flash start\n");
+	while (remain_sects != 0)
+	{
+		if ((sect_offset + remain_sects) < SECTORS_PER_PAGE)
+		{
+			num_sectors_to_read = remain_sects;
+		}
+		else
+		{
+			num_sectors_to_read = SECTORS_PER_PAGE - sect_offset;
+		}
+
+		//uart_printf("test write. RS = %d, NSTR = %d, lpn= %d\n", remain_sects, num_sectors_to_read,lpn);
+		bank = get_num_bank(lpn); // page striping
+		vpn = get_vpn_flash(lpn);
+		CHECK_VPAGE(vpn);
+		//uart_printf("get_vpn_flash fin\n");
+		if (vpn != NULL)
+		{
+			//uart_printf("if vpn !=null");
+			nand_page_ptread_to_host(bank,
+				vpn / PAGES_PER_BLK,
+				vpn % PAGES_PER_BLK,
+				sect_offset,
+				num_sectors_to_read);
+			//uart_printf("if vpn !=null fin");
+		}
+		// The host is requesting to read a logical page that has never been written to.
+		else
+		{
+
+			UINT32 next_read_buf_id = (g_ftl_read_buf_id + 1) % NUM_RD_BUFFERS;
+
+			//uart_printf("if vpn =null");
+#if OPTION_FTL_TEST == 0
+			while (next_read_buf_id == GETREG(SATA_RBUF_PTR));	// wait if the read buffer is full (slow host)
+#endif
+
+																// fix bug @ v.1.0.6
+																// Send 0xFF...FF to host when the host request to read the sector that has never been written.
+																// In old version, for example, if the host request to read unwritten sector 0 after programming in sector 1, Jasmine would send 0x00...00 to host.
+																// However, if the host already wrote to sector 1, Jasmine would send 0xFF...FF to host when host request to read sector 0. (ftl_read() in ftl_xxx/ftl.c)
+			mem_set_dram(RD_BUF_PTR(g_ftl_read_buf_id) + sect_offset*BYTES_PER_SECTOR,
+				0xFFFFFFFF, num_sectors_to_read*BYTES_PER_SECTOR);
+
+			flash_finish();
+
+			SETREG(BM_STACK_RDSET, next_read_buf_id);	// change bm_read_limit
+			SETREG(BM_STACK_RESET, 0x02);				// change bm_read_limit
+
+			g_ftl_read_buf_id = next_read_buf_id;
+
+			//uart_printf("if vpn =null fub");
+		}
+		sect_offset = 0;
+		remain_sects -= num_sectors_to_read;
+		lpn++;
+		//uart_printf("ftl_read_flash fin");
+		
+	}
+}
 void ftl_write(UINT32 const lba, UINT32 const num_sectors)
 {
     UINT32 remain_sects, num_sectors_to_write;
     UINT32 lpn, sect_offset;
 
+ //uart_printf("here is ftl_write lba:%d, num_sectors:%d",lba,num_sectors);
     lpn          = lba / SECTORS_PER_PAGE;
     sect_offset  = lba % SECTORS_PER_PAGE;
     remain_sects = num_sectors;
@@ -409,6 +495,8 @@ static void write_page(UINT32 const lpn, UINT32 const sect_offset, UINT32 const 
 
     UINT32 bank, old_vpn, new_vpn;
     UINT32 vblock, page_num, page_offset, column_cnt;
+
+// uart_print("here is write_page");
 
     bank        = get_num_bank(lpn); // page striping
     page_offset = sect_offset;
@@ -513,11 +601,270 @@ static void write_page(UINT32 const lpn, UINT32 const sect_offset, UINT32 const 
     set_vpn(lpn, new_vpn);
     set_vcount(bank, vblock, get_vcount(bank, vblock) + 1);
 }
+
+void ftl_write_flash(UINT32 const lba, UINT32 const num_sectors)
+{
+	UINT32 remain_sects, num_sectors_to_write;
+	UINT32 lpn, sect_offset;
+
+	//uart_printf("here is ftl_write lba:%d, num_sectors:%d",lba,num_sectors);
+	lpn = lba / SECTORS_PER_PAGE;
+	sect_offset = lba % SECTORS_PER_PAGE;
+	remain_sects = num_sectors;
+
+	while (remain_sects != 0)
+	{
+		if ((sect_offset + remain_sects) < SECTORS_PER_PAGE)
+		{
+			num_sectors_to_write = remain_sects;
+		}
+		else
+		{
+			num_sectors_to_write = SECTORS_PER_PAGE - sect_offset;
+		}
+		// single page write individually
+		write_page_flash(lpn, sect_offset, num_sectors_to_write);
+
+		sect_offset = 0;
+		remain_sects -= num_sectors_to_write;
+		lpn++;
+	}
+}
+static void write_page_flash(UINT32 const lpn, UINT32 const sect_offset, UINT32 const num_sectors)
+{
+	CHECK_LPAGE(lpn);
+	ASSERT(sect_offset < SECTORS_PER_PAGE);
+	ASSERT(num_sectors > 0 && num_sectors <= SECTORS_PER_PAGE);
+
+	UINT32 bank, old_vpn, new_vpn;
+	UINT32 vblock, page_num, page_offset, column_cnt;
+
+	// uart_print("here is write_page");
+
+	bank = get_num_bank(lpn); // page striping
+	page_offset = sect_offset;
+	column_cnt = num_sectors;
+
+	new_vpn = assign_new_write_vpn(bank);
+	old_vpn = get_vpn_flash(lpn);
+
+	CHECK_VPAGE(old_vpn);
+	CHECK_VPAGE(new_vpn);
+	ASSERT(old_vpn != new_vpn);
+
+	g_ftl_statistics[bank].page_wcount++;
+
+	// if old data already exist,
+	if (old_vpn != NULL)
+	{
+		vblock = old_vpn / PAGES_PER_BLK;
+		page_num = old_vpn % PAGES_PER_BLK;
+
+		//--------------------------------------------------------------------------------------
+		// `Partial programming'
+		// we could not determine whether the new data is loaded in the SATA write buffer.
+		// Thus, read the left/right hole sectors of a valid page and copy into the write buffer.
+		// And then, program whole valid data
+		//--------------------------------------------------------------------------------------
+		if (num_sectors != SECTORS_PER_PAGE)
+		{
+			// Performance optimization (but, not proved)
+			// To reduce flash memory access, valid hole copy into SATA write buffer after reading whole page
+			// Thus, in this case, we need just one full page read + one or two mem_copy
+			if ((num_sectors <= 8) && (page_offset != 0))
+			{
+				// one page async read
+				nand_page_read(bank,
+					vblock,
+					page_num,
+					FTL_BUF(bank));
+				// copy `left hole sectors' into SATA write buffer
+				if (page_offset != 0)
+				{
+					mem_copy(WR_BUF_PTR(g_ftl_write_buf_id),
+						FTL_BUF(bank),
+						page_offset * BYTES_PER_SECTOR);
+				}
+				// copy `right hole sectors' into SATA write buffer
+				if ((page_offset + column_cnt) < SECTORS_PER_PAGE)
+				{
+					UINT32 const rhole_base = (page_offset + column_cnt) * BYTES_PER_SECTOR;
+
+					mem_copy(WR_BUF_PTR(g_ftl_write_buf_id) + rhole_base,
+						FTL_BUF(bank) + rhole_base,
+						BYTES_PER_PAGE - rhole_base);
+				}
+			}
+			// left/right hole async read operation (two partial page read)
+			else
+			{
+				// read `left hole sectors'
+				if (page_offset != 0)
+				{
+					nand_page_ptread(bank,
+						vblock,
+						page_num,
+						0,
+						page_offset,
+						WR_BUF_PTR(g_ftl_write_buf_id),
+						RETURN_ON_ISSUE);
+				}
+				// read `right hole sectors'
+				if ((page_offset + column_cnt) < SECTORS_PER_PAGE)
+				{
+					nand_page_ptread(bank,
+						vblock,
+						page_num,
+						page_offset + column_cnt,
+						SECTORS_PER_PAGE - (page_offset + column_cnt),
+						WR_BUF_PTR(g_ftl_write_buf_id),
+						RETURN_ON_ISSUE);
+				}
+			}
+		}
+		// full page write
+		page_offset = 0;
+		column_cnt = SECTORS_PER_PAGE;
+		// invalid old page (decrease vcount)
+		set_vcount(bank, vblock, get_vcount(bank, vblock) - 1);
+	}
+	vblock = new_vpn / PAGES_PER_BLK;
+	page_num = new_vpn % PAGES_PER_BLK;
+	ASSERT(get_vcount(bank, vblock) < (PAGES_PER_BLK - 1));
+
+	// write new data (make sure that the new data is ready in the write buffer frame)
+	// (c.f FO_B_SATA_W flag in flash.h)
+	nand_page_ptprogram_from_host(bank,
+		vblock,
+		page_num,
+		page_offset,
+		column_cnt);
+	// update metadata
+	set_lpn(bank, page_num, lpn);
+	set_vpn_flash(lpn, new_vpn);
+	set_vcount(bank, vblock, get_vcount(bank, vblock) + 1);
+}
 // get vpn from PAGE_MAP
 static UINT32 get_vpn(UINT32 const lpn)
 {
     CHECK_LPAGE(lpn);
     return read_dram_32(PAGE_MAP_ADDR + lpn * sizeof(UINT32));
+}
+
+static UINT32 get_vpn_flash(UINT32 const lpn)
+{
+	CHECK_LPAGE(lpn);
+	UINT32 pmap_addr = PAGE_MAP_ADDR;//¾Ö°¡¹®Á¦ÀÎµíÇÔ.
+	UINT32 page_addr;
+	UINT32 pmap_bytes = BYTES_PER_PAGE; // per bank
+	UINT32 pmap_boundary = PAGE_MAP_ADDR + (NUM_LPAGES * sizeof(UINT32));
+	UINT32 mapblk_num, mapblk_lbn, bank;
+	BOOL32 finished = FALSE;
+
+	//uart_printf("get_vpn_flash start! bank num : %d mapbklk num : %d",NUM_BANKS, MAPBLKS_PER_BANK);
+	//ÇØ´ç flash memory ÁÖ¼Ò
+	mapblk_num = lpn / (BYTES_PER_PAGE / 4);
+	mapblk_lbn = mapblk_num / NUM_BANKS;
+	bank = mapblk_num % NUM_BANKS;
+
+
+
+	//uart_printf("ttttttttt!");
+	//uart_printf("lpn %d mapblk_lbn %d BANK %d MAPBLKS_PER_BANK %d", lpn,mapblk_lbn, bank,MAPBLKS_PER_BANK);
+	//¿¡·¯Ã³¸® ¾ÆÁ÷ ±¸Çö ¾ÈÇÏ°Ú´Ù.   
+//	if (pmap_addr >= pmap_boundary)
+	//	finished = TRUE;
+	
+	if (mapblk_lbn >= MAPBLKS_PER_BANK || bank >= NUM_BANKS) {
+		uart_printf("null!");
+		return NULL;
+	}
+
+
+
+
+	//uart_printf("get_vpn_flash start! %d %d %d %d %d ", bank,
+	//	get_mapblk_vpn(bank, mapblk_lbn) / PAGES_PER_BLK,
+	//	get_mapblk_vpn(bank, mapblk_lbn) % PAGES_PER_BLK, pmap_bytes / BYTES_PER_SECTOR,
+	//	FTL_BUF(bank));
+
+
+	//uart_printf("nand_page_ptread start!");
+
+	flash_finish();
+	
+	
+	
+	nand_page_ptread(bank,
+		get_mapblk_vpn(bank, mapblk_lbn) / PAGES_PER_BLK,
+		get_mapblk_vpn(bank, mapblk_lbn) % PAGES_PER_BLK,
+		0,
+		pmap_bytes / BYTES_PER_SECTOR,
+		FTL_BUF(bank),
+		RETURN_ON_ISSUE);
+	flash_finish();
+
+	//uart_printf("nand_page_ptread fin!");
+	//ftl_buf ÀÇ °ªÀÌ ÇëÅ¬¾îÁö´Â°ÇÁö ¾Æ´ÑÁö ÀÇ¹®ÀÌ µé±ä ÇÑ´Ù. ¾Æ¸¶ ¹®Á¦ ¾øÀ»µíÇÔ.	
+
+	//mem_copy(page_addr, FTL_BUF(bank), pmap_bytes);
+	page_addr =read_dram_32(FTL_BUF(bank) + (lpn % (BYTES_PER_PAGE / 4)) * sizeof(UINT32));
+	//uart_printf("mem_copy fin!");
+	return page_addr;
+	/*  for (mapblk_lbn = 0; mapblk_lbn < MAPBLKS_PER_BANK; mapblk_lbn++)
+	{
+	temp_page_addr = pmap_addr; // backup page mapping addr
+
+	for (bank = 0; bank < NUM_BANKS; bank++)
+	{
+	if (finished)
+	{
+	break;
+	}
+	else if (pmap_addr >= pmap_boundary)
+	{
+	finished = TRUE;
+	break;
+	}
+	else if (pmap_addr + BYTES_PER_PAGE >= pmap_boundary)
+	{
+	finished = TRUE;
+	pmap_bytes = (pmap_boundary - pmap_addr + BYTES_PER_SECTOR - 1) / BYTES_PER_SECTOR * BYTES_PER_SECTOR;
+	}
+	// read page mapping table from map_block
+	nand_page_ptread(bank,
+	get_mapblk_vpn(bank, mapblk_lbn) / PAGES_PER_BLK,
+	get_mapblk_vpn(bank, mapblk_lbn) % PAGES_PER_BLK,
+	0,
+	pmap_bytes / BYTES_PER_SECTOR,
+	FTL_BUF(bank),
+	RETURN_ON_ISSUE);
+	pmap_addr += pmap_bytes;
+	}
+	flash_finish();
+
+	pmap_bytes = BYTES_PER_PAGE;
+	for (bank = 0; bank < NUM_BANKS; bank++)
+	{
+	if (temp_page_addr >= pmap_boundary)
+	{
+	break;
+	}
+	else if (temp_page_addr + BYTES_PER_PAGE >= pmap_boundary)
+	{
+	pmap_bytes = (pmap_boundary - temp_page_addr + BYTES_PER_SECTOR - 1) / BYTES_PER_SECTOR * BYTES_PER_SECTOR;
+	}
+	// copy page mapping table to PMAP_ADDR from FTL buffer
+	mem_copy(temp_page_addr, FTL_BUF(bank), pmap_bytes);
+
+	temp_page_addr += pmap_bytes;
+	}
+	if (finished)
+	{
+	break;
+	}
+	}
+	*/
 }
 // set vpn to PAGE_MAP
 static void set_vpn(UINT32 const lpn, UINT32 const vpn)
@@ -526,6 +873,101 @@ static void set_vpn(UINT32 const lpn, UINT32 const vpn)
     ASSERT(vpn >= (META_BLKS_PER_BANK * PAGES_PER_BLK) && vpn < (VBLKS_PER_BANK * PAGES_PER_BLK));
 
     write_dram_32(PAGE_MAP_ADDR + lpn * sizeof(UINT32), vpn);
+}
+
+//flash ¿¡µµ ¼³Á¤ÇØ¶ó
+static void set_vpn_flash(UINT32 const lpn, UINT32 const vpn)
+{
+	UINT32 pmap_bytes = BYTES_PER_PAGE; // per bank
+	UINT32 mapblk_num, mapblk_lbn, bank;
+	UINT32 vblock, page_num, page_offset
+		CHECK_LPAGE(lpn);
+	ASSERT(vpn >= (META_BLKS_PER_BANK * PAGES_PER_BLK) && vpn < (VBLKS_PER_BANK * PAGES_PER_BLK));
+
+	write_dram_32(PAGE_MAP_ADDR + lpn * sizeof(UINT32), vpn);
+
+	//by °ÇÃ¶ 17.02.01
+	mapblk_num = lpn / (BYTES_PER_PAGE / 4);
+	mapblk_lbn = mapblk_num / NUM_BANKS;
+	bank = mapblk_num % NUM_BANKS;
+
+
+
+	//uart_printf("ttttttttt!");
+	//uart_printf("lpn %d mapblk_lbn %d BANK %d MAPBLKS_PER_BANK %d", lpn,mapblk_lbn, bank,MAPBLKS_PER_BANK);
+	//¿¡·¯Ã³¸® ¾ÆÁ÷ ±¸Çö ¾ÈÇÏ°Ú´Ù.   
+	//	if (pmap_addr >= pmap_boundary)
+	//	finished = TRUE;
+
+	if (mapblk_lbn >= MAPBLKS_PER_BANK || bank >= NUM_BANKS) {
+		uart_printf("null!");
+		return NULL;
+	}
+
+
+
+
+	//uart_printf("get_vpn_flash start! %d %d %d %d %d ", bank,
+	//	get_mapblk_vpn(bank, mapblk_lbn) / PAGES_PER_BLK,
+	//	get_mapblk_vpn(bank, mapblk_lbn) % PAGES_PER_BLK, pmap_bytes / BYTES_PER_SECTOR,
+	//	FTL_BUF(bank));
+
+
+	//uart_printf("nand_page_ptread start!");
+
+	flash_finish();
+
+
+
+	nand_page_ptread(bank,
+		get_mapblk_vpn(bank, mapblk_lbn) / PAGES_PER_BLK,
+		get_mapblk_vpn(bank, mapblk_lbn) % PAGES_PER_BLK,
+		0,
+		pmap_bytes / BYTES_PER_SECTOR,
+		FTL_BUF(bank),
+		RETURN_ON_ISSUE);
+	flash_finish();
+	/*
+	inc_mapblk_vpn(bank, mapblk_lbn);
+
+	mapblk_vpn = get_mapblk_vpn(bank, mapblk_lbn);
+
+	// note: if there is no free page, then erase old map block first.
+	if ((mapblk_vpn % PAGES_PER_BLK) == 0)
+	{
+		// erase full map block
+		nand_block_erase(bank, (mapblk_vpn - 1) / PAGES_PER_BLK);
+
+		// next vpn of mapblk is offset #0
+		set_mapblk_vpn(bank, mapblk_lbn, ((mapblk_vpn - 1) / PAGES_PER_BLK) * PAGES_PER_BLK);
+		mapblk_vpn = get_mapblk_vpn(bank, mapblk_lbn);
+	}
+	// copy the page mapping table to FTL buffer
+	mem_copy(FTL_BUF(bank), pmap_addr, pmap_bytes);
+
+	// logging update page mapping table into map_block
+	nand_page_ptprogram(bank,
+		mapblk_vpn / PAGES_PER_BLK,
+		mapblk_vpn % PAGES_PER_BLK,
+		0,
+		pmap_bytes / BYTES_PER_SECTOR,
+		FTL_BUF(bank));
+	pmap_addr += pmap_bytes;
+	*/
+	vblock = get_mapblk_vpn(bank, mapblk_lbn) / PAGES_PER_BLK;
+	page_num = get_mapblk_vpn(bank, mapblk_lbn) % PAGES_PER_BLK;
+	//  ASSERT(get_vcount(bank,vblock) < (PAGES_PER_BLK - 1));
+
+	// write new data (make sure that the new data is ready in the write buffer frame)
+	// (c.f FO_B_SATA_W flag in flash.h)
+	//write buffer	ÀÇ ³»¿ëÀ» ³½µå¿¡ Àûµµ·Ï ¼öÇàÇÏ´Â ¸í·É¹®Àº »ç½Ç ¿©±â¹Û¿¡¾ø´Ù.
+	//write buffer¿¡ ³»¿ëÀÌ ´Ù µé¾î°¬°í, ÀÌ¸¦ ³½µå ÇÃ·¡½Ã ÄÁÆ®·Ñ¿¡¼­ ½ÇÁ¦ ¼öÇà
+	nand_page_ptprogram_from_host(bank,
+		vblock,
+		page_num,
+		0,
+		pmap_bytes / BYTES_PER_SECTOR);
+
 }
 // get valid page count of vblock
 static UINT32 get_vcount(UINT32 const bank, UINT32 const vblock)
@@ -829,7 +1271,7 @@ static void init_metadata_sram(void)
         do
         {
             vblock++;
-            // í˜„ìž¬ next vblockë¶€í„° ìƒˆë¡œìš´ ë°ì´í„°ë¥¼ ì €ìž¥ì„ ì‹œìž‘
+            // ?„ìž¬ next vblockë¶€???ˆë¡œ???°ì´?°ë? ?€?¥ì„ ?œìž‘
             set_new_write_vpn(bank, vblock * PAGES_PER_BLK);
             ASSERT(vblock < VBLKS_PER_BANK);
         }while(is_bad_block(bank, vblock) == TRUE);
